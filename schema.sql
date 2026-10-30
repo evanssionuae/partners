@@ -74,3 +74,16 @@ CREATE TABLE IF NOT EXISTS deals (
 );
 CREATE INDEX IF NOT EXISTS idx_deals_user ON deals(user_id);
 CREATE INDEX IF NOT EXISTS idx_deals_match ON deals(vendor, customer);
+
+CREATE TABLE IF NOT EXISTS activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  user_id INTEGER,
+  email TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,                          -- login | login_failed | logout | view | download | deal_submit | admin
+  detail TEXT NOT NULL DEFAULT '',
+  ip TEXT NOT NULL DEFAULT '',
+  country TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity(ts);
+CREATE INDEX IF NOT EXISTS idx_activity_user ON activity(user_id, ts);

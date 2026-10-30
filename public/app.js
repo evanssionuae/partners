@@ -218,7 +218,7 @@ function accountView() {
 }
 
 /* ---------------------------------------------------------------- admin */
-function adminTabs(cur) { return h('div', { class: 'tabs' }, [['users', 'Access requests & users'], ['deals', 'Deal registrations'], ['content', 'Content']].map(([k, t]) => h('a', { class: 'tab', href: '#/admin/' + k, 'aria-current': k === cur ? 'page' : null }, t))); }
+function adminTabs(cur) { return h('div', { class: 'tabs' }, [['users', 'Access requests & users'], ['deals', 'Deal registrations'], ['content', 'Content'], ['activity', 'Activity']].map(([k, t]) => h('a', { class: 'tab', href: '#/admin/' + k, 'aria-current': k === cur ? 'page' : null }, t))); }
 async function adminUsers() {
   const r = await api('admin/users'); let filter = 'pending';
   const sel = h('select', { 'aria-label': 'Filter' }, [['pending', 'Awaiting approval'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['suspended', 'Suspended'], ['all', 'Everyone']].map(([v, t]) => h('option', { value: v }, t)));
@@ -227,7 +227,7 @@ async function adminUsers() {
   const draw = () => {
     const rows = r.items.filter((u) => filter === 'all' || u.status === filter);
     list.replaceChildren(...(rows.length ? rows.map((u) => {
-      const co = h('input', { value: u.company, 'aria-label': 'Company', maxlength: 140 });
+      const co = h('input', { value: u.company, 'aria-label': 'Company', maxlength: 140 }); const box = h('div', { 'aria-live': 'polite' });
       return h('article', { class: 'card item' }, h('div', { class: 'meta' }, h('b', {}, u.name), badge(USER_LABEL, u.status), u.role === 'admin' ? h('span', { class: 'badge' }, 'Administrator') : null),
         h('dl', { class: 'dl' }, h('dt', {}, 'Email'), h('dd', {}, u.email), h('dt', {}, 'Country · phone'), h('dd', {}, [u.country, u.phone].filter(Boolean).join(' · ') || '—'), h('dt', {}, 'Requested'), h('dd', {}, fmtDate(u.created_at)), h('dt', {}, 'Last sign-in'), h('dd', {}, u.last_login ? fmtDate(u.last_login) : 'never')),
         h('label', { class: 'field' }, h('span', {}, 'Company (edit before approving if needed)'), co),
@@ -236,7 +236,10 @@ async function adminUsers() {
           u.status === 'pending' ? h('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: () => act(u, 'reject') }, 'Reject') : null,
           u.status === 'approved' && u.id !== me.id ? h('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: () => confirm(`Suspend ${u.name}? They will be signed out.`) && act(u, 'suspend') }, 'Suspend') : null,
           u.status === 'approved' && u.role === 'partner' ? h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => confirm(`Make ${u.name} an administrator?`) && act(u, 'promote') }, 'Make administrator') : null,
-          u.status === 'approved' && u.role === 'admin' && u.id !== me.id ? h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => act(u, 'demote') }, 'Remove administrator') : null));
+          u.status === 'approved' && u.role === 'admin' && u.id !== me.id ? h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => act(u, 'demote') }, 'Remove administrator') : null,
+          u.status === 'approved' ? h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: async () => { try { const r = await api('admin/users/' + u.id, { method: 'POST', json: { action: 'reset_link' } }); box.replaceChildren(h('div', { class: 'notice ok', role: 'status' }, h('b', {}, 'Reset link (valid 24 hours, also emailed): '), h('br'), h('input', { value: r.link, readonly: true, 'aria-label': 'Reset link', onfocus: (e) => e.target.select() }))); } catch (e) { toast(e.message); } } }, 'Reset password') : null,
+          h('a', { class: 'btn btn-secondary btn-sm', href: '#/admin/activity/' + u.id }, 'Activity'),
+          u.id !== me.id ? h('button', { class: 'btn btn-danger btn-sm', type: 'button', onclick: () => confirm(`Remove ${u.name} permanently? Their account, sign-in history and access are deleted. Their deal registrations stay on record. To block access but keep the record, use Suspend instead.`) && act(u, 'delete') }, 'Remove user') : null), box);
     }) : [h('div', { class: 'empty' }, 'Nobody in this list.')]));
   };
   sel.addEventListener('change', () => { filter = sel.value; draw(); });
@@ -295,6 +298,21 @@ async function adminContent() {
   show(wrap(h('div', { class: 'page-head' }, h('div', {}, h('p', { class: 'eyebrow' }, 'Admin'), h('h1', {}, 'Content'))), adminTabs('content'), formHost, h('h2', {}, `All items (${items.length})`), list)); drawForm(); drawList();
 }
 
+async function adminActivity(uid) {
+  const users = (await api('admin/users')).items; let user = uid || ''; let action = '';
+  const usel = h('select', { 'aria-label': 'Person' }, h('option', { value: '' }, 'Everyone'), users.map((u) => h('option', { value: u.id, selected: String(u.id) === String(user) }, `${u.name} (${u.company})`)));
+  const asel = h('select', { 'aria-label': 'Type' }, [['', 'All activity'], ['login', 'Sign-ins'], ['login_failed', 'Failed sign-ins'], ['view', 'Pages viewed'], ['download', 'Downloads'], ['deal_submit', 'Deals submitted'], ['admin', 'Admin actions'], ['logout', 'Sign-outs']].map(([v, t]) => h('option', { value: v }, t)));
+  const host = h('div', {});
+  const LBL = { login: 'Signed in', login_failed: 'Failed sign-in', logout: 'Signed out', view: 'Viewed', download: 'Downloaded', deal_submit: 'Submitted deal', admin: 'Admin action' };
+  const load = async () => {
+    const r = await api(`admin/activity?user=${user}&action=${action}`);
+    host.replaceChildren(r.items.length ? h('div', { class: 'tablewrap' }, h('table', {}, h('thead', {}, h('tr', {}, ['When', 'Who', 'What', 'Detail', 'From'].map((t) => h('th', { scope: 'col' }, t)))), h('tbody', {}, r.items.map((x) => h('tr', {}, h('td', {}, new Date(x.ts).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })), h('td', {}, x.name ? `${x.name} · ${x.company}` : (x.email || '—')), h('td', {}, LBL[x.action] || x.action), h('td', {}, x.detail), h('td', {}, [x.country, x.ip].filter(Boolean).join(' · ')))))))
+      : h('div', { class: 'empty' }, 'No activity recorded yet.'));
+  };
+  usel.addEventListener('change', () => { user = usel.value; load(); }); asel.addEventListener('change', () => { action = asel.value; load(); });
+  show(wrap(h('div', { class: 'page-head' }, h('div', {}, h('p', { class: 'eyebrow' }, 'Admin'), h('h1', {}, 'Activity'), h('p', { class: 'muted' }, 'The latest 300 events. Records are kept for 180 days. Sign-ins, pages viewed, downloads, deals and admin actions.'))), adminTabs('activity'), h('div', { class: 'toolbar' }, h('div', { class: 'field' }, usel), h('div', { class: 'field' }, asel)), host)); await load();
+}
+
 /* ---------------------------------------------------------------- router */
 async function route() {
   const hash = location.hash || '#/'; const [, p1, p2, p3] = hash.split('/');
@@ -311,7 +329,7 @@ async function route() {
     if (['sales', 'presales', 'technical', 'spiff'].includes(p1)) return await resourcesView(p1);
     if (p1 === 'deals') return p2 === 'new' ? await dealForm() : p2 === 'edit' ? await dealForm(p3) : await dealsView();
     if (p1 === 'account') return accountView();
-    if (p1 === 'admin') { if (me.role !== 'admin') { location.hash = '#/'; return; } return p2 === 'deals' ? await adminDeals() : p2 === 'content' ? await adminContent() : await adminUsers(); }
+    if (p1 === 'admin') { if (me.role !== 'admin') { location.hash = '#/'; return; } return p2 === 'activity' ? await adminActivity(p3) : p2 === 'deals' ? await adminDeals() : p2 === 'content' ? await adminContent() : await adminUsers(); }
     show(wrap(h('h1', {}, 'Page not found'), h('p', { class: 'muted' }, h('a', { href: '#/' }, 'Back to the dashboard'))));
   } catch (e) {
     if (e.status === 401) { me = false; location.hash = '#/login'; return; }

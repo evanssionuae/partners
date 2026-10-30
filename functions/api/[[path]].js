@@ -48,6 +48,11 @@ async function startSession(env, url, user) {
   await env.DB.prepare('DELETE FROM sessions WHERE expires < ?').bind(nowSec()).run();
   return sessionCookie(url, tok, SESSION_DAYS * 86400);
 }
+function track(ctx, env, request, user, action, detail = '', email = '') {
+  const p = env.DB.prepare('INSERT INTO activity (ts, user_id, email, action, detail, ip, country) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .bind(now(), user ? user.id : null, user ? user.email : email, action, String(detail).slice(0, 300), ip(request), request.headers.get('CF-IPCountry') || '').run().catch(() => {});
+  ctx.waitUntil(p);
+}
 const adminMail = (env) => env.PORTAL_ADMIN_EMAIL || env.LEAD_TO || 'sales@evanssion.com';
 const checkPwPolicy = (pw) => { if (typeof pw !== 'string' || pw.length < 10) fail(400, 'Use a password of at least 10 characters.'); if (pw.length > 200) fail(400, 'Password is too long.'); };
 
@@ -105,11 +110,13 @@ async function route(ctx, request, env, url, seg) {
     if (await blocked(env, key, 6, 900)) fail(429, 'Too many failed sign-in attempts. Wait 15 minutes and try again.');
     const u = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
     const ok = u ? await checkPw(String(d.password || ''), u.pw) : (await hashPw('x'), false);
-    if (!ok) { await bump(env, key, 900); fail(401, 'Email or password is not correct.'); }
+    if (!ok) { await bump(env, key, 900); track(ctx, env, request, null, 'login_failed', '', email); fail(401, 'Email or password is not correct.'); }
     if (u.status === 'pending') fail(403, 'Your request is waiting for approval by the Evanssion team. We will email you as soon as it is approved.');
     if (u.status !== 'approved') fail(403, 'This account is not active. Please contact the Evanssion team.');
     await clearKey(env, key);
     const cookie = await startSession(env, url, u);
+    track(ctx, env, request, u, 'login');
+    ctx.waitUntil(env.DB.prepare('DELETE FROM activity WHERE ts < ?').bind(new Date(Date.now() - 180 * 86400000).toISOString()).run());
     return json({ user: pub(u) }, 200, { 'Set-Cookie': cookie });
   }
 
@@ -142,6 +149,7 @@ async function route(ctx, request, env, url, seg) {
   }
 
   if (a === 'logout' && m === 'POST') {
+    const who = await sessionUser(request, env, url); if (who) track(ctx, env, request, who, 'logout');
     const tok = readCookie(request, cookieName(url));
     if (tok) await env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(await sha256(tok)).run();
     return json({ ok: true }, 200, { 'Set-Cookie': sessionCookie(url, '', 0) });
@@ -174,6 +182,7 @@ async function route(ctx, request, env, url, seg) {
   }
 
   if (a === 'summary' && m === 'GET') {
+    track(ctx, env, request, user, 'view', 'dashboard');
     const cat = await env.DB.prepare('SELECT category, COUNT(*) AS n FROM resources WHERE published = 1 GROUP BY category').all();
     const today = new Date().toISOString().slice(0, 10);
     const sp = await env.DB.prepare("SELECT COUNT(*) AS n FROM resources WHERE category = 'spiff' AND published = 1 AND (ends IS NULL OR ends = '' OR ends >= ?) AND (starts IS NULL OR starts = '' OR starts <= ?)").bind(today, today).first();
@@ -196,6 +205,7 @@ async function route(ctx, request, env, url, seg) {
   if (a === 'resources' && !b && m === 'GET') {
     const cat = clean(url.searchParams.get('category'), 20);
     if (!CATS.includes(cat)) fail(400, 'Unknown category.');
+    track(ctx, env, request, user, 'view', cat);
     const order = cat === 'spiff' ? 'ORDER BY COALESCE(NULLIF(ends, \'\'), \'9999-12-31\') ASC, id DESC' : 'ORDER BY vendor ASC, id DESC';
     const r = await env.DB.prepare(`SELECT id, category, vendor, title, description, kind, url, file_id, file_name, file_size, file_type, reward, starts, ends, created_at FROM resources WHERE category = ? AND published = 1 ${order}`).bind(cat).all();
     return json({ items: r.results });
@@ -206,6 +216,7 @@ async function route(ctx, request, env, url, seg) {
     if (!row || !env.FILES) fail(404, 'File not found.');
     const obj = await env.FILES.get('f:' + row.file_id, 'stream');
     if (!obj) fail(404, 'File not found.');
+    track(ctx, env, request, user, 'download', `${row.title} (${row.file_name})`);
     const inline = url.searchParams.get('inline') === '1' && row.file_type === 'application/pdf';
     const safe = (row.file_name || 'download').replace(/[^\w.\- ]+/g, '_');
     return new Response(obj, { headers: {
@@ -218,12 +229,13 @@ async function route(ctx, request, env, url, seg) {
 
   /* ----------------------------------------------------------------- deals */
   if (a === 'deals' && !b && m === 'GET') {
+    track(ctx, env, request, user, 'view', isAdmin ? 'deals (admin)' : 'deals');
     const st = clean(url.searchParams.get('status'), 20);
     const w = []; const args = [];
     if (!isAdmin) { w.push('d.user_id = ?'); args.push(user.id); }
     if (DEAL_STATUS.includes(st)) { w.push('d.status = ?'); args.push(st); }
     const conflicts = isAdmin ? ", (SELECT COUNT(*) FROM deals o WHERE o.id != d.id AND o.vendor = d.vendor COLLATE NOCASE AND lower(o.customer) = lower(d.customer) AND o.status IN ('submitted','approved')) AS conflicts" : '';
-    const r = await env.DB.prepare(`SELECT d.*, u.name AS partner_name, u.company AS partner_company, u.email AS partner_email${conflicts} FROM deals d JOIN users u ON u.id = d.user_id ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY d.id DESC LIMIT 500`).bind(...args).all();
+    const r = await env.DB.prepare(`SELECT d.*, COALESCE(u.name, 'Removed user') AS partner_name, COALESCE(u.company, '') AS partner_company, COALESCE(u.email, '') AS partner_email${conflicts} FROM deals d LEFT JOIN users u ON u.id = d.user_id ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY d.id DESC LIMIT 500`).bind(...args).all();
     return json({ items: r.results });
   }
 
@@ -253,6 +265,7 @@ async function route(ctx, request, env, url, seg) {
     const id = res.meta.last_row_id;
     const ref = `DR-${t.slice(0, 4)}-${String(id).padStart(4, '0')}`;
     await env.DB.prepare('UPDATE deals SET ref = ? WHERE id = ?').bind(ref, id).run();
+    track(ctx, env, request, user, 'deal_submit', `${ref} ${v.customer} / ${v.vendor}`);
     ctx.waitUntil(sendMail(env, { to: adminMail(env), subject: `Deal registration ${ref}: ${v.customer} (${v.vendor})`, replyTo: user.email,
       html: mailShell('New deal registration', `<p><b>${esc(user.company)}</b> (${esc(user.name)}) registered <b>${esc(v.customer)}</b> for <b>${esc(v.vendor)}</b>${v.product ? ' — ' + esc(v.product) : ''}.</p><p>Value: ${v.value_usd != null ? 'USD ' + v.value_usd.toLocaleString('en-US') : 'not stated'}</p><p><a href="${url.origin}/#/admin/deals">Review in the portal</a></p>`) }));
     return json({ ok: true, ref });
@@ -295,13 +308,35 @@ async function route(ctx, request, env, url, seg) {
       else if (act === 'promote') { if (target.status !== 'approved') fail(400, 'Approve the user first.'); await env.DB.prepare("UPDATE users SET role = 'admin' WHERE id = ?").bind(target.id).run(); }
       else if (act === 'demote') await env.DB.prepare("UPDATE users SET role = 'partner' WHERE id = ?").bind(target.id).run();
       else if (act === 'company') { const co = clean(d.company, 140); if (!co) fail(400, 'Company is required.'); await env.DB.prepare('UPDATE users SET company = ? WHERE id = ?').bind(co, target.id).run(); }
-      else fail(400, 'Unknown action.');
+      else if (act === 'delete') {
+        if (target.id === user.id) fail(400, 'You cannot remove your own account.');
+        await env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target.id).run();
+        await env.DB.prepare('DELETE FROM resets WHERE user_id = ?').bind(target.id).run();
+        await env.DB.prepare('DELETE FROM activity WHERE user_id = ?').bind(target.id).run();
+        await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(target.id).run();
+      } else if (act === 'reset_link') {
+        const tok = randToken();
+        await env.DB.prepare('INSERT INTO resets (id, user_id, expires) VALUES (?, ?, ?)').bind(await sha256(tok), target.id, nowSec() + 86400).run();
+        const link = `${url.origin}/#/reset/${tok}`;
+        ctx.waitUntil(sendMail(env, { to: target.email, subject: 'Reset your Evanssion partner password', html: mailShell('Reset your password', `<p>An administrator started a password reset for you. Use this link within 24 hours:</p><p><a href="${link}">Choose a new password</a></p>`) }));
+        track(ctx, env, request, user, 'admin', `reset link for ${target.email}`);
+        return json({ ok: true, link });
+      } else fail(400, 'Unknown action.');
+      track(ctx, env, request, user, 'admin', `${act} ${target.email}`);
       return json({ ok: true });
+    }
+
+    if (b === 'activity' && m === 'GET') {
+      const w = []; const args = [];
+      const uid = +url.searchParams.get('user'); if (uid) { w.push('a.user_id = ?'); args.push(uid); }
+      const act = clean(url.searchParams.get('action'), 20); if (act) { w.push('a.action = ?'); args.push(act); }
+      const r = await env.DB.prepare(`SELECT a.id, a.ts, a.user_id, a.email, a.action, a.detail, a.ip, a.country, u.name, u.company FROM activity a LEFT JOIN users u ON u.id = a.user_id ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY a.id DESC LIMIT 300`).bind(...args).all();
+      return json({ items: r.results });
     }
 
     if (b === 'deals' && c && m === 'POST') {
       const d = await body(request);
-      const row = await env.DB.prepare('SELECT d.*, u.email AS pe, u.name AS pn FROM deals d JOIN users u ON u.id = d.user_id WHERE d.id = ?').bind(+c).first();
+      const row = await env.DB.prepare('SELECT d.*, u.email AS pe, u.name AS pn FROM deals d LEFT JOIN users u ON u.id = d.user_id WHERE d.id = ?').bind(+c).first();
       if (!row) fail(404, 'Deal not found.');
       const status = clean(d.status, 20); const note = clean(d.note, 1000);
       if (!['approved', 'rejected', 'info'].includes(status)) fail(400, 'Choose a decision.');
@@ -310,7 +345,8 @@ async function route(ctx, request, env, url, seg) {
       const until = status === 'approved' ? new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10) : null;
       await env.DB.prepare('UPDATE deals SET status = ?, admin_note = ?, decided_at = ?, protected_until = ?, updated_at = ? WHERE id = ?').bind(status, note, t, until, t, row.id).run();
       const label = { approved: 'approved', rejected: 'not approved', info: 'waiting for more information' }[status];
-      ctx.waitUntil(sendMail(env, { to: row.pe, subject: `Deal registration ${row.ref} ${label}`,
+      track(ctx, env, request, user, 'admin', `deal ${row.ref} ${status}`);
+      if (row.pe) ctx.waitUntil(sendMail(env, { to: row.pe, subject: `Deal registration ${row.ref} ${label}`,
         html: mailShell(`Deal registration ${label}`, `<p>Hello ${esc(row.pn)}, your registration <b>${esc(row.ref)}</b> for <b>${esc(row.customer)}</b> (${esc(row.vendor)}) is <b>${label}</b>.</p>${until ? `<p>Registration protection runs until <b>${until}</b>.</p>` : ''}${note ? `<p>Note from Evanssion: ${esc(note)}</p>` : ''}<p><a href="${url.origin}/#/deals">Open your deals</a></p>`) }));
       return json({ ok: true });
     }
@@ -362,6 +398,7 @@ async function route(ctx, request, env, url, seg) {
         await env.DB.prepare('UPDATE resources SET category=?, vendor=?, title=?, description=?, kind=?, url=?, file_id=?, file_name=?, file_size=?, file_type=?, reward=?, starts=?, ends=?, published=?, updated_at=? WHERE id=?')
           .bind(data.category, data.vendor, data.title, data.description, kind, data.url, fid, fname, fsize, ftype, data.reward, data.starts, data.ends, data.published, t, old.id).run();
       }
+      track(ctx, env, request, user, 'admin', `${m === 'POST' ? 'added' : 'edited'} ${cat}: ${title}`);
       return json({ ok: true });
     }
 
@@ -369,6 +406,7 @@ async function route(ctx, request, env, url, seg) {
       const old = await env.DB.prepare('SELECT file_id FROM resources WHERE id = ?').bind(+c).first();
       if (old?.file_id && env.FILES) await env.FILES.delete('f:' + old.file_id);
       await env.DB.prepare('DELETE FROM resources WHERE id = ?').bind(+c).run();
+      track(ctx, env, request, user, 'admin', `deleted resource ${c}`);
       return json({ ok: true });
     }
   }
